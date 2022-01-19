@@ -16,8 +16,10 @@
 
 package fr.acinq.eclair.blockchain
 
+import fr.acinq.bitcoin.psbt.Psbt
 import fr.acinq.bitcoin.scalacompat.Crypto.PublicKey
-import fr.acinq.bitcoin.scalacompat.{Satoshi, Transaction}
+import fr.acinq.bitcoin.scalacompat.DeterministicWallet.ExtendedPublicKey
+import fr.acinq.bitcoin.scalacompat.{ByteVector32, KotlinUtils, Satoshi, Transaction}
 import fr.acinq.eclair.blockchain.fee.FeeratePerKw
 import scodec.bits.ByteVector
 
@@ -33,7 +35,7 @@ trait OnChainChannelFunder {
   import OnChainWallet.MakeFundingTxResponse
 
   /** Create a channel funding transaction with the provided pubkeyScript. */
-  def makeFundingTx(pubkeyScript: ByteVector, amount: Satoshi, feeRatePerKw: FeeratePerKw)(implicit ec: ExecutionContext): Future[MakeFundingTxResponse]
+  def makeFundingTx(chainHash: ByteVector32, localFundingKey: ExtendedPublicKey, remoteFundingKey: PublicKey, amount: Satoshi, feeRatePerKw: FeeratePerKw)(implicit ec: ExecutionContext): Future[MakeFundingTxResponse]
 
   /**
    * Committing *must* include publishing the transaction on the network.
@@ -95,6 +97,7 @@ object OnChainWallet {
 
   final case class OnChainBalance(confirmed: Satoshi, unconfirmed: Satoshi)
 
-  final case class MakeFundingTxResponse(fundingTx: Transaction, fundingTxOutputIndex: Int, fee: Satoshi)
-
+  final case class MakeFundingTxResponse(psbt: Psbt, fundingTxOutputIndex: Int, fee: Satoshi) {
+    def fundingTx(): Transaction = KotlinUtils.kmp2scala(psbt.extract().getRight)
+  }
 }

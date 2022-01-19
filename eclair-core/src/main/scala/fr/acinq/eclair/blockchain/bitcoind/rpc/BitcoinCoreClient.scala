@@ -16,15 +16,18 @@
 
 package fr.acinq.eclair.blockchain.bitcoind.rpc
 
+import fr.acinq.bitcoin.psbt.{KeyPathWithMaster, Psbt}
 import fr.acinq.bitcoin.scalacompat.Crypto.PublicKey
 import fr.acinq.bitcoin.scalacompat._
-import fr.acinq.bitcoin.{Bech32, Block}
+import fr.acinq.bitcoin.{Bech32, Block, SigHash}
+import fr.acinq.bitcoin.scalacompat.DeterministicWallet.ExtendedPublicKey
 import fr.acinq.eclair.ShortChannelId.coordinates
 import fr.acinq.eclair.blockchain.OnChainWallet
 import fr.acinq.eclair.blockchain.OnChainWallet.{MakeFundingTxResponse, OnChainBalance}
 import fr.acinq.eclair.blockchain.bitcoind.ZmqWatcher.{GetTxWithMetaResponse, UtxoStatus, ValidateResult}
+import fr.acinq.eclair.blockchain.bitcoind.rpc.BitcoinCoreClient.{FundPsbtInput, FundPsbtOptions, FundPsbtResponse, ProcessPsbtResponse}
 import fr.acinq.eclair.blockchain.fee.{FeeratePerKB, FeeratePerKw}
-import fr.acinq.eclair.transactions.Transactions
+import fr.acinq.eclair.transactions.{Scripts, Transactions}
 import fr.acinq.eclair.wire.protocol.ChannelAnnouncement
 import fr.acinq.eclair.{BlockHeight, TimestampSecond, TxCoordinates}
 import grizzled.slf4j.Logging
@@ -32,8 +35,9 @@ import org.json4s.Formats
 import org.json4s.JsonAST._
 import scodec.bits.ByteVector
 
+import java.util.Base64
 import scala.concurrent.{ExecutionContext, Future}
-import scala.jdk.CollectionConverters.ListHasAsScala
+import scala.jdk.CollectionConverters.{ListHasAsScala, MapHasAsJava, SeqHasAsJava}
 import scala.util.{Failure, Success, Try}
 
 /**
@@ -220,25 +224,92 @@ class BitcoinCoreClient(val rpcClient: BitcoinJsonRPCClient) extends OnChainWall
     })
   }
 
-  def makeFundingTx(pubkeyScript: ByteVector, amount: Satoshi, targetFeerate: FeeratePerKw)(implicit ec: ExecutionContext): Future[MakeFundingTxResponse] = {
-    val partialFundingTx = Transaction(
-      version = 2,
-      txIn = Seq.empty[TxIn],
-      txOut = TxOut(amount, pubkeyScript) :: Nil,
-      lockTime = 0)
+  def fundPsbt(inputs: Seq[FundPsbtInput], outputs: Seq[(String, Satoshi)], locktime: Long, options: FundPsbtOptions)(implicit ec: ExecutionContext): Future[FundPsbtResponse] = {
+    rpcClient.invoke("walletcreatefundedpsbt", inputs.toArray, outputs.map { case (a, b) => a -> b.toBtc.toBigDecimal }, locktime, options).map(json => {
+      val JString(base64) = json \ "psbt"
+      val JInt(changePos) = json \ "changepos"
+      val JDecimal(fee) = json \ "fee"
+      val bin = Base64.getDecoder.decode(base64)
+      val psbt = Psbt.read(bin).getRight
+      val changePos_opt = if (changePos >= 0) Some(changePos.intValue) else None
+      FundPsbtResponse(psbt, toSatoshi(fee), changePos_opt)
+    })
+  }
+
+  def fundPsbt(outputs: Seq[(String, Satoshi)], locktime: Long, options: FundPsbtOptions)(implicit ec: ExecutionContext): Future[FundPsbtResponse] =
+    fundPsbt(Seq(), outputs, locktime, options)
+
+  def processPsbt(psbt: Psbt, sign: Boolean = true, sighashType: Int = SigHash.SIGHASH_ALL)(implicit ec: ExecutionContext): Future[ProcessPsbtResponse] = {
+    val sighashStrings = Map(
+      SigHash.SIGHASH_ALL -> "ALL",
+      SigHash.SIGHASH_NONE -> "NONE",
+      SigHash.SIGHASH_SINGLE -> "SINGLE",
+      (SigHash.SIGHASH_ALL | SigHash.SIGHASH_ANYONECANPAY) -> "ALL|ANYONECANPAY",
+      (SigHash.SIGHASH_NONE | SigHash.SIGHASH_ANYONECANPAY) -> "NONE|ANYONECANPAY",
+      (SigHash.SIGHASH_SINGLE | SigHash.SIGHASH_ANYONECANPAY) -> "SINGLE|ANYONECANPAY")
+    val sighash = sighashStrings.getOrElse(sighashType, throw new IllegalArgumentException(s"invalid sighash flag ${sighashType}"))
+    rpcClient.invoke("walletprocesspsbt", Base64.getEncoder.encodeToString(Psbt.write(psbt).toByteArray), sign, sighash).map(json => {
+      val JString(base64) = json \ "psbt"
+      val JBool(complete) = json \ "complete"
+      val psbt = Psbt.read(Base64.getDecoder.decode(base64)).getRight
+      ProcessPsbtResponse(psbt, complete)
+    })
+  }
+
+  private def signPsbtOrUnlock(psbt: Psbt)(implicit ec: ExecutionContext): Future[ProcessPsbtResponse] = {
+    val f = for {
+      ProcessPsbtResponse(psbt1, complete) <- processPsbt(psbt)
+      _ = if (!complete) throw JsonRPCError(Error(0, "cannot sign psbt"))
+    } yield ProcessPsbtResponse(psbt1, complete)
+    // if signature fails (e.g. because wallet is encrypted) we need to unlock the utxos
+    f.recoverWith { case _ =>
+      unlockOutpoints(psbt.getGlobal.getTx.txIn.asScala.toSeq.map(_.outPoint).map(KotlinUtils.kmp2scala))
+        .recover { case t: Throwable => // no-op, just add a log in case of failure
+          logger.warn(s"Cannot unlock failed transaction's UTXOs txid=${psbt.getGlobal.getTx.txid}", t)
+          t
+        }
+        .flatMap(_ => f) // return signTransaction error
+        .recoverWith { case _ => f } // return signTransaction error
+    }
+  }
+
+  override def makeFundingTx(chainHash: ByteVector32, localFundingKey: ExtendedPublicKey, remoteFundingKey: PublicKey, amount: Satoshi, feeRatePerKw: FeeratePerKw)(implicit ec: ExecutionContext): Future[MakeFundingTxResponse] = {
+    logger.info(s"funding psbt with local_funding_key=$localFundingKey and remote_funding_key=$remoteFundingKey")
+    val fundingPubkeyScript = Script.write(Script.pay2wsh(Scripts.multiSig2of2(localFundingKey.publicKey, remoteFundingKey)))
+    val Some(fundingAddress) = computeScriptAddress(chainHash, fundingPubkeyScript)
+
+    def updatePsbt(psbt: Psbt, changepos_opt: Option[Int], ourbip32path: Seq[Long]): Psbt = {
+      val outputIndex = changepos_opt match {
+        case None => 0
+        case Some(changePos) => 1 - changePos
+      }
+      psbt.updateWitnessOutput(outputIndex, null, null, Map(
+        KotlinUtils.scala2kmp(localFundingKey.publicKey) -> new KeyPathWithMaster(localFundingKey.parent, DeterministicWallet.KeyPath(ourbip32path).keyPath),
+        KotlinUtils.scala2kmp(remoteFundingKey) -> new KeyPathWithMaster(0L, DeterministicWallet.KeyPath("1/2/3/4").keyPath)
+      ).asJava
+      ).getRight
+    }
+
     for {
-      feerate <- mempoolMinFee().map(minFee => FeeratePerKw(minFee).max(targetFeerate))
-      // we ask bitcoin core to add inputs to the funding tx, and use the specified change address
-      fundTxResponse <- fundTransaction(partialFundingTx, FundTransactionOptions(feerate, lockUtxos = true))
+      // we ask bitcoin core to create and fund the funding tx
+      feerate <- mempoolMinFee().map(minFee => FeeratePerKw(minFee).max(feeRatePerKw))
+      FundPsbtResponse(psbt, fee, changePos_opt) <- fundPsbt(Seq(fundingAddress -> amount), 0, FundPsbtOptions(feerate, lockUtxos = true, changePosition = Some(1)))
+      ourbip32path = localFundingKey.path.path.drop(2)
+      _ = logger.info(s"funded psbt = $psbt")
+      psbt1 = updatePsbt(psbt, changePos_opt, ourbip32path)
       // now let's sign the funding tx
-      SignTransactionResponse(fundingTx, true) <- signTransactionOrUnlock(fundTxResponse.tx)
+      ProcessPsbtResponse(signedPsbt, complete) <- signPsbtOrUnlock(psbt1)
+      _ = logger.info(s"psbt signing complete = $complete")
+      extracted = signedPsbt.extract()
+      _ = if (extracted.isLeft) logger.error(s"psbt failure $extracted")
+      fundingTx = extracted.getRight
       // there will probably be a change output, so we need to find which output is ours
-      outputIndex <- Transactions.findPubKeyScriptIndex(fundingTx, pubkeyScript) match {
+      outputIndex <- Transactions.findPubKeyScriptIndex(KotlinUtils.kmp2scala(fundingTx), fundingPubkeyScript) match {
         case Right(outputIndex) => Future.successful(outputIndex)
         case Left(skipped) => Future.failed(new RuntimeException(skipped.toString))
       }
-      _ = logger.debug(s"created funding txid=${fundingTx.txid} outputIndex=$outputIndex fee=${fundTxResponse.fee}")
-    } yield MakeFundingTxResponse(fundingTx, outputIndex, fundTxResponse.fee)
+      _ = logger.debug(s"created funding txid=${fundingTx.txid} outputIndex=$outputIndex fee=${fee}")
+    } yield MakeFundingTxResponse(signedPsbt, outputIndex, fee)
   }
 
   def commit(tx: Transaction)(implicit ec: ExecutionContext): Future[Boolean] = publishTransaction(tx).transformWith {
@@ -476,6 +547,22 @@ object BitcoinCoreClient {
   case class FundTransactionResponse(tx: Transaction, fee: Satoshi, changePosition: Option[Int]) {
     val amountIn: Satoshi = fee + tx.txOut.map(_.amount).sum
   }
+
+  case class FundPsbtInput(txid: ByteVector32, vout: Int, sequence_opt: Option[Long] = None)
+
+  case class FundPsbtOptions(feeRate: BigDecimal, replaceable: Boolean, lockUnspents: Boolean, changePosition: Option[Int], add_inputs: Boolean)
+
+  object FundPsbtOptions {
+    def apply(feerate: FeeratePerKw, replaceable: Boolean = true, lockUtxos: Boolean = false, changePosition: Option[Int] = None, add_inputs: Boolean = true): FundPsbtOptions = {
+      FundPsbtOptions(BigDecimal(FeeratePerKB(feerate).toLong).bigDecimal.scaleByPowerOfTen(-8), replaceable, lockUtxos, changePosition, add_inputs)
+    }
+  }
+
+  case class FundPsbtResponse(psbt: Psbt, fee: Satoshi, changePosition: Option[Int]) {
+    val amountIn: Satoshi = Option(psbt.computeFees()).map(KotlinUtils.kmp2scala).get + psbt.getGlobal.getTx.txOut.asScala.map(_.amount).map(KotlinUtils.kmp2scala).sum
+  }
+
+  case class ProcessPsbtResponse(psbt: Psbt, complete: Boolean)
 
   case class PreviousTx(txid: ByteVector32, vout: Long, scriptPubKey: String, redeemScript: String, witnessScript: String, amount: BigDecimal)
 

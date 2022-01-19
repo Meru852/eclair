@@ -18,9 +18,12 @@ package fr.acinq.eclair.blockchain
 
 import fr.acinq.bitcoin.TxIn.SEQUENCE_FINAL
 import fr.acinq.bitcoin.scalacompat.Crypto.PublicKey
-import fr.acinq.bitcoin.scalacompat.{ByteVector32, Crypto, OutPoint, Satoshi, SatoshiLong, Transaction, TxIn, TxOut}
+import fr.acinq.bitcoin.scalacompat.{ByteVector32, Crypto, DeterministicWallet, KotlinUtils, OutPoint, Satoshi, SatoshiLong, Script, Transaction, TxIn, TxOut}
+import fr.acinq.bitcoin.psbt.Psbt
 import fr.acinq.eclair.blockchain.OnChainWallet.{MakeFundingTxResponse, OnChainBalance}
 import fr.acinq.eclair.blockchain.fee.FeeratePerKw
+import fr.acinq.eclair.randomKey
+import fr.acinq.eclair.transactions.Scripts
 import scodec.bits._
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -41,9 +44,9 @@ class DummyOnChainWallet extends OnChainWallet {
 
   override def getReceivePubkey(receiveAddress: Option[String] = None)(implicit ec: ExecutionContext): Future[Crypto.PublicKey] = Future.successful(dummyReceivePubkey)
 
-  override def makeFundingTx(pubkeyScript: ByteVector, amount: Satoshi, feeRatePerKw: FeeratePerKw)(implicit ec: ExecutionContext): Future[MakeFundingTxResponse] = {
-    val tx = DummyOnChainWallet.makeDummyFundingTx(pubkeyScript, amount)
-    funded += (tx.fundingTx.txid -> tx.fundingTx)
+  override def makeFundingTx(chainHash: ByteVector32, localFundingKey: DeterministicWallet.ExtendedPublicKey, remoteFundingKey: PublicKey, amount: Satoshi, feeRatePerKw: FeeratePerKw)(implicit ec: ExecutionContext): Future[MakeFundingTxResponse] = {
+    val tx = DummyOnChainWallet.makeDummyFundingTx(Script.write(Script.pay2wsh(Scripts.multiSig2of2(localFundingKey.publicKey, remoteFundingKey))), amount)
+    funded += (tx.fundingTx().txid -> tx.fundingTx())
     Future.successful(tx)
   }
 
@@ -68,7 +71,8 @@ class NoOpOnChainWallet extends OnChainWallet {
 
   override def getReceivePubkey(receiveAddress: Option[String] = None)(implicit ec: ExecutionContext): Future[Crypto.PublicKey] = Future.successful(dummyReceivePubkey)
 
-  override def makeFundingTx(pubkeyScript: ByteVector, amount: Satoshi, feeRatePerKw: FeeratePerKw)(implicit ec: ExecutionContext): Future[MakeFundingTxResponse] = Promise[MakeFundingTxResponse]().future // will never be completed
+  override def makeFundingTx(chainHash: ByteVector32, localFundingKey: DeterministicWallet.ExtendedPublicKey, remoteFundingKey: PublicKey, amount: Satoshi, feeRatePerKw: FeeratePerKw)(implicit ec: ExecutionContext): Future[MakeFundingTxResponse] =
+    Promise[MakeFundingTxResponse]().future // will never be completed
 
   override def commit(tx: Transaction)(implicit ec: ExecutionContext): Future[Boolean] = Future.successful(true)
 
@@ -84,11 +88,22 @@ object DummyOnChainWallet {
   val dummyReceivePubkey: PublicKey = PublicKey(hex"028feba10d0eafd0fad8fe20e6d9206e6bd30242826de05c63f459a00aced24b12")
 
   def makeDummyFundingTx(pubkeyScript: ByteVector, amount: Satoshi): MakeFundingTxResponse = {
+    import KotlinUtils._
+    val key = randomKey()
+    val baseTx = Transaction(version = 2, txIn = Nil, txOut = TxOut(amount, Script.pay2wpkh(key.publicKey)) :: Nil, lockTime = 0)
     val fundingTx = Transaction(version = 2,
-      txIn = TxIn(OutPoint(ByteVector32(ByteVector.fill(32)(1)), 42), signatureScript = Nil, sequence = SEQUENCE_FINAL) :: Nil,
+      txIn = TxIn(OutPoint(baseTx, 0), signatureScript = Nil, sequence = SEQUENCE_FINAL) :: Nil,
       txOut = TxOut(amount, pubkeyScript) :: Nil,
       lockTime = 0)
-    MakeFundingTxResponse(fundingTx, 0, 420 sat)
+
+    // TODO: this is really ugly :(
+    val psbt = new Psbt(fundingTx)
+      .updateWitnessInputTx(baseTx, 0, null, fr.acinq.bitcoin.Script.pay2pkh(key.publicKey), null, java.util.Map.of())
+      .map(p => p.sign(key, 0).getRight)
+      .map(p => p.getPsbt.finalizeWitnessInput(0, Script.witnessPay2wpkh(key.publicKey, p.getSig))).getRight
+      .getRight
+
+    MakeFundingTxResponse(psbt, 0, 420 sat)
   }
 
 }

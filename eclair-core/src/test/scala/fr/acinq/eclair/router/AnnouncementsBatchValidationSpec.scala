@@ -21,14 +21,15 @@ import akka.pattern.pipe
 import akka.testkit.TestProbe
 import sttp.client3.okhttp.OkHttpFutureBackend
 import fr.acinq.bitcoin.scalacompat.Crypto.PrivateKey
-import fr.acinq.bitcoin.scalacompat.{Block, Satoshi, SatoshiLong, Script, Transaction}
+import fr.acinq.bitcoin.scalacompat.DeterministicWallet.{ExtendedPublicKey, KeyPath}
+import fr.acinq.bitcoin.scalacompat.{Block, KotlinUtils, Satoshi, SatoshiLong, Script, Transaction}
 import fr.acinq.eclair.blockchain.bitcoind.ZmqWatcher.ValidateResult
 import fr.acinq.eclair.blockchain.bitcoind.rpc.BitcoinJsonRPCAuthMethod.UserPassword
 import fr.acinq.eclair.blockchain.bitcoind.rpc.{BasicBitcoinJsonRPCClient, BitcoinCoreClient}
 import fr.acinq.eclair.blockchain.fee.FeeratePerKw
 import fr.acinq.eclair.transactions.Scripts
 import fr.acinq.eclair.wire.protocol.{ChannelAnnouncement, ChannelUpdate}
-import fr.acinq.eclair.{BlockHeight, CltvExpiryDelta, Features, MilliSatoshiLong, ShortChannelId, randomKey}
+import fr.acinq.eclair.{BlockHeight, CltvExpiryDelta, Features, MilliSatoshiLong, ShortChannelId, randomBytes32, randomKey}
 import org.json4s.JsonAST.JString
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -92,11 +93,15 @@ object AnnouncementsBatchValidationSpec {
     val node2BitcoinKey = randomKey()
     val amount = 1000000 sat
     // first we publish the funding tx
-    val fundingPubkeyScript = Script.write(Script.pay2wsh(Scripts.multiSig2of2(node1BitcoinKey.publicKey, node2BitcoinKey.publicKey)))
-    val fundingTxFuture = bitcoinClient.makeFundingTx(fundingPubkeyScript, amount, FeeratePerKw(10000 sat))
+    val fundingTxFuture = bitcoinClient.makeFundingTx(
+      Block.RegtestGenesisBlock.hash,
+      ExtendedPublicKey(node1BitcoinKey.publicKey.value, randomBytes32(), 4, KeyPath("m/1/2/3/4"), 0),
+      node2BitcoinKey.publicKey,
+      amount, FeeratePerKw(10000 sat))
     val res = Await.result(fundingTxFuture, 10 seconds)
-    Await.result(bitcoinClient.publishTransaction(res.fundingTx), 10 seconds)
-    SimulatedChannel(node1Key, node2Key, node1BitcoinKey, node2BitcoinKey, amount, res.fundingTx, res.fundingTxOutputIndex)
+    val fundingTx = KotlinUtils.kmp2scala(res.psbt.extract().getRight)
+    Await.result(bitcoinClient.publishTransaction(fundingTx), 10 seconds)
+    SimulatedChannel(node1Key, node2Key, node1BitcoinKey, node2BitcoinKey, amount, fundingTx, res.fundingTxOutputIndex)
   }
 
   def makeChannelAnnouncement(c: SimulatedChannel, bitcoinClient: BitcoinCoreClient)(implicit ec: ExecutionContext): ChannelAnnouncement = {
