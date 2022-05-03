@@ -123,7 +123,7 @@ object TestConstants {
         maxFundingSatoshis = 16777215 sat,
       ),
       onChainFeeConf = OnChainFeeConf(
-        feeTargets = FeeTargets(6, 2, 36, 12, 18, 0),
+        feeTargets = FeeTargets(6, 2, 36, spendAnchorWithoutHtlcs = true, 12, 18, 0),
         feeEstimator = new TestFeeEstimator,
         closeOnOfflineMismatch = true,
         updateFeeMinDiffRatio = 0.1,
@@ -264,7 +264,7 @@ object TestConstants {
         maxFundingSatoshis = 16777215 sat,
       ),
       onChainFeeConf = OnChainFeeConf(
-        feeTargets = FeeTargets(6, 2, 36, 12, 18, 0),
+        feeTargets = FeeTargets(6, 2, 36, spendAnchorWithoutHtlcs = true, 12, 18, 0),
         feeEstimator = new TestFeeEstimator,
         closeOnOfflineMismatch = true,
         updateFeeMinDiffRatio = 0.1,

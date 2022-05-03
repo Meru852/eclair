@@ -333,6 +333,7 @@ object NodeParams extends Logging {
       fundingBlockTarget = config.getInt("on-chain-fees.target-blocks.funding"),
       commitmentBlockTarget = config.getInt("on-chain-fees.target-blocks.commitment"),
       commitmentWithoutHtlcsBlockTarget = config.getInt("on-chain-fees.target-blocks.commitment-without-htlcs"),
+      spendAnchorWithoutHtlcs = config.getBoolean("on-chain-fees.target-blocks.spend-anchor-without-htlcs"),
       mutualCloseBlockTarget = config.getInt("on-chain-fees.target-blocks.mutual-close"),
       claimMainBlockTarget = config.getInt("on-chain-fees.target-blocks.claim-main"),
       safeUtxosThreshold = config.getInt("on-chain-fees.target-blocks.safe-utxos-threshold"),
