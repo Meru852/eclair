@@ -24,7 +24,7 @@ import fr.acinq.eclair.payment.send.PaymentInitiator
 import fr.acinq.eclair.payment.{Bolt11Invoice, PaymentSent}
 import fr.acinq.eclair.router.Router
 import fr.acinq.eclair.wire.protocol.IPAddress
-import fr.acinq.eclair.{BlockHeight, MilliSatoshi, MilliSatoshiLong, NodeParams, RealShortChannelId, TestBitcoinCoreClient, TestDatabases, TestFeeEstimator}
+import fr.acinq.eclair.{BlockHeight, MilliSatoshi, NodeParams, RealShortChannelId, TestBitcoinCoreClient, TestDatabases, TestFeeEstimator}
 import org.scalatest.Assertions
 import org.scalatest.concurrent.Eventually.eventually
 
@@ -151,7 +151,7 @@ object MinimalNodeFixture extends Assertions {
 
   def openChannel(node1: MinimalNodeFixture, node2: MinimalNodeFixture, funding: Satoshi, channelType_opt: Option[SupportedChannelType] = None)(implicit system: ActorSystem): ChannelOpened = {
     val sender = TestProbe("sender")
-    sender.send(node1.switchboard, Peer.OpenChannel(node2.nodeParams.nodeId, funding, 0L msat, channelType_opt, None, None, None))
+    sender.send(node1.switchboard, Peer.OpenChannel(node2.nodeParams.nodeId, funding, channelType_opt, None, None, None, None))
     sender.expectMsgType[ChannelOpened]
   }
 
