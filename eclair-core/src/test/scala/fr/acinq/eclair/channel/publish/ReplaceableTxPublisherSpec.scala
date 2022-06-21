@@ -16,6 +16,7 @@
 
 package fr.acinq.eclair.channel.publish
 
+import akka.actor.Status
 import akka.actor.typed.ActorRef
 import akka.actor.typed.scaladsl.adapter.{ClassicActorSystemOps, actorRefAdapter}
 import akka.pattern.pipe
@@ -322,6 +323,27 @@ class ReplaceableTxPublisherSpec extends TestKitBaseClass with AnyFunSuiteLike w
       // When the remote commit tx is still unconfirmed, we want to retry in case it is evicted from the mempool and our
       // commit is then published.
       assert(result.reason == CouldNotFund)
+    }
+  }
+
+  test("package relay") {
+    withFixture(Seq(500 millibtc), ChannelTypes.AnchorOutputsZeroFeeHtlcTx(scidAlias = false, zeroConf = false)) { f =>
+      import f._
+
+      // For this test to work, you must build glozow's branch: https://github.com/glozow/bitcoin/tree/package-mempool-accept
+      // And put the resulting bitcoind inside eclair-core/target/bitcoin-0.21.1/bin
+      val (commitTx, anchorTx) = closeChannelWithoutHtlcs(f, aliceBlockHeight() + 6)
+      assert(commitTx.fee === 0.sat)
+
+      wallet.publishTransaction(commitTx.tx).pipeTo(probe.ref)
+      probe.expectMsgType[Status.Failure]
+      assert(getMempool().length === 0)
+
+      setFeerate(FeeratePerKw(3000 sat))
+      publisher ! Publish(probe.ref, anchorTx)
+      // wait for the commit tx and anchor tx to be published
+      val mempoolTxs = getMempoolTxs(2)
+      assert(mempoolTxs.map(_.txid).contains(commitTx.tx.txid))
     }
   }
 

@@ -88,13 +88,13 @@ object ReplaceableTxFunder {
    * We need this because fundrawtransaction doesn't allow us to leave non-wallet inputs, so we have to add them
    * afterwards which may bring the resulting feerate below our target.
    */
-  def adjustAnchorOutputChange(unsignedTx: ClaimLocalAnchorWithWitnessData, commitTx: Transaction, amountIn: Satoshi, commitFeerate: FeeratePerKw, targetFeerate: FeeratePerKw, dustLimit: Satoshi): ClaimLocalAnchorWithWitnessData = {
+  def adjustAnchorOutputChange(unsignedTx: ClaimLocalAnchorWithWitnessData, commitTx: Transaction, amountIn: Satoshi, targetFeerate: FeeratePerKw, dustLimit: Satoshi): ClaimLocalAnchorWithWitnessData = {
     require(unsignedTx.txInfo.tx.txOut.size == 1, "funded transaction should have a single change output")
     // We take into account witness weight and adjust the fee to match our desired feerate.
     val dummySignedClaimAnchorTx = addSigs(unsignedTx.txInfo, PlaceHolderSig)
     // NB: we assume that our bitcoind wallet uses only P2WPKH inputs when funding txs.
     val estimatedWeight = commitTx.weight() + dummySignedClaimAnchorTx.tx.weight() + claimP2WPKHOutputWitnessWeight * (dummySignedClaimAnchorTx.tx.txIn.size - 1)
-    val targetFee = weight2fee(targetFeerate, estimatedWeight) - weight2fee(commitFeerate, commitTx.weight())
+    val targetFee = weight2fee(targetFeerate, estimatedWeight)
     val amountOut = dustLimit.max(amountIn - targetFee)
     val updatedAnchorTx = unsignedTx.updateTx(unsignedTx.txInfo.tx.copy(txOut = Seq(unsignedTx.txInfo.tx.txOut.head.copy(amount = amountOut))))
     updatedAnchorTx
@@ -244,16 +244,7 @@ private class ReplaceableTxFunder(nodeParams: NodeParams,
   def fund(txWithWitnessData: ReplaceableTxWithWitnessData, targetFeerate: FeeratePerKw): Behavior[Command] = {
     txWithWitnessData match {
       case claimLocalAnchor: ClaimLocalAnchorWithWitnessData =>
-        val commitFeerate = cmd.commitments.localCommit.spec.commitTxFeerate
-        if (targetFeerate <= commitFeerate) {
-          log.info("skipping {}: commit feerate is high enough (feerate={})", cmd.desc, commitFeerate)
-          // We set retry = true in case the on-chain feerate rises before the commit tx is confirmed: if that happens
-          // we'll want to claim our anchor to raise the feerate of the commit tx and get it confirmed faster.
-          replyTo ! FundingFailed(TxPublisher.TxRejectedReason.TxSkipped(retryNextBlock = true))
-          Behaviors.stopped
-        } else {
-          addWalletInputs(claimLocalAnchor, targetFeerate)
-        }
+        addWalletInputs(claimLocalAnchor, targetFeerate)
       case htlcTx: HtlcWithWitnessData =>
         val htlcFeerate = cmd.commitments.localCommit.spec.htlcTxFeerate(cmd.commitments.commitmentFormat)
         if (targetFeerate <= htlcFeerate) {
@@ -405,13 +396,12 @@ private class ReplaceableTxFunder(nodeParams: NodeParams,
 
   private def addInputs(anchorTx: ClaimLocalAnchorWithWitnessData, targetFeerate: FeeratePerKw, commitments: Commitments): Future[(ClaimLocalAnchorWithWitnessData, Satoshi)] = {
     val dustLimit = commitments.localParams.dustLimit
-    val commitFeerate = commitments.localCommit.spec.commitTxFeerate
     val commitTx = dummySignedCommitTx(commitments).tx
     // We want the feerate of the package (commit tx + tx spending anchor) to equal targetFeerate.
     // Thus we have: anchorFeerate = targetFeerate + (weight-commit-tx / weight-anchor-tx) * (targetFeerate - commitTxFeerate)
     // If we use the smallest weight possible for the anchor tx, the feerate we use will thus be greater than what we want,
     // and we can adjust it afterwards by raising the change output amount.
-    val anchorFeerate = targetFeerate + FeeratePerKw(targetFeerate.feerate - commitFeerate.feerate) * commitTx.weight() / claimAnchorOutputMinWeight
+    val anchorFeerate = targetFeerate + targetFeerate * commitTx.weight() / claimAnchorOutputMinWeight
     // NB: fundrawtransaction requires at least one output, and may add at most one additional change output.
     // Since the purpose of this transaction is just to do a CPFP, the resulting tx should have a single change output
     // (note that bitcoind doesn't let us publish a transaction with no outputs).
@@ -441,7 +431,7 @@ private class ReplaceableTxFunder(nodeParams: NodeParams,
       // NB: we insert the anchor input in the *first* position because our signing helpers only sign input #0.
       val unsignedTx = anchorTx.updateTx(fundTxResponse.tx.copy(txIn = anchorTx.txInfo.tx.txIn.head +: fundTxResponse.tx.txIn))
       val totalAmountIn = fundTxResponse.amountIn + AnchorOutputsCommitmentFormat.anchorAmount
-      (adjustAnchorOutputChange(unsignedTx, commitTx, totalAmountIn, commitFeerate, targetFeerate, dustLimit), totalAmountIn)
+      (adjustAnchorOutputChange(unsignedTx, commitTx, totalAmountIn, targetFeerate, dustLimit), totalAmountIn)
     })
   }
 

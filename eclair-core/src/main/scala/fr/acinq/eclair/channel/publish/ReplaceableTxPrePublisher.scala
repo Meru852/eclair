@@ -136,10 +136,7 @@ private class ReplaceableTxPrePublisher(nodeParams: NodeParams,
         // The funding transaction was found, let's see if we can still spend it.
         bitcoinClient.isTransactionOutputSpendable(fundingOutpoint.txid, fundingOutpoint.index.toInt, includeMempool = false).flatMap {
           case false => Future.failed(CommitTxAlreadyConfirmed)
-          case true =>
-            // We must ensure our local commit tx is in the mempool before publishing the anchor transaction.
-            // If it's already published, this call will be a no-op.
-            bitcoinClient.publishTransaction(commitTx)
+          case true => Future.successful(commitTx.txid)
         }
       case None =>
         // If the funding transaction cannot be found (e.g. when using 0-conf), we should retry later.

@@ -67,7 +67,7 @@ class ReplaceableTxFunderSpec extends TestKitBaseClass with AnyFunSuiteLike {
         txIn = anchorTx.tx.txIn ++ walletInputs,
         txOut = TxOut(amountOut, Script.pay2wpkh(PlaceHolderPubKey)) :: Nil,
       )))
-      val adjustedTx = adjustAnchorOutputChange(unsignedTx, commitTx.tx, amountIn, commitFeerate, targetFeerate, dustLimit)
+      val adjustedTx = adjustAnchorOutputChange(unsignedTx, commitTx.tx, amountIn, targetFeerate, dustLimit)
       assert(adjustedTx.txInfo.tx.txIn.size == unsignedTx.txInfo.tx.txIn.size)
       assert(adjustedTx.txInfo.tx.txOut.size == 1)
       assert(adjustedTx.txInfo.tx.txOut.head.amount >= dustLimit)

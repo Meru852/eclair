@@ -311,6 +311,27 @@ class BitcoinCoreClient(val rpcClient: BitcoinJsonRPCClient) extends OnChainWall
         getRawTransaction(tx.txid).map(_ => tx.txid).recoverWith { case _ => Future.failed(e) }
     }
 
+  def publishPackage(txs: Seq[Transaction])(implicit ec: ExecutionContext): Future[Seq[ByteVector32]] = {
+    rpcClient.invoke("submitpackage", txs.map(_.toString())).map(json => {
+      println("submitpackage response:")
+      println(json)
+      val packageFeerate_opt = Try {
+        val JDecimal(packageFeerate) = json \ "package-feerate"
+        FeeratePerKw(FeeratePerKB(toSatoshi(packageFeerate)))
+      }.toOption
+      packageFeerate_opt.foreach(packageFeerate => println(s"package-feerate=$packageFeerate"))
+      val JObject(results) = json \ "tx-results"
+      val txids = results.map { case (_, tx) =>
+        val JString(txid) = tx \ "txid"
+        val JInt(vsize) = tx \ "vsize"
+        val JDecimal(fees) = tx \ "fees" \ "base"
+        println(s"package contains txid=$txid with vsize=$vsize paying fees=${toSatoshi(fees)}")
+        ByteVector32.fromValidHex(txid)
+      }
+      txids
+    })
+  }
+
   /**
    * Mark a transaction as abandoned, which will allow for its wallet inputs to be re-spent.
    * This method can be used to replace "stuck" or evicted transactions.

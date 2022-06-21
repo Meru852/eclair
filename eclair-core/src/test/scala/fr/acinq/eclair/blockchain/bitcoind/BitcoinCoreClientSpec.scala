@@ -20,8 +20,11 @@ import akka.actor.Status.Failure
 import akka.pattern.pipe
 import akka.testkit.TestProbe
 import fr.acinq.bitcoin
-import fr.acinq.bitcoin.scalacompat.Crypto.PublicKey
-import fr.acinq.bitcoin.scalacompat.{Block, BtcDouble, ByteVector32, MilliBtcDouble, OutPoint, Satoshi, SatoshiLong, Script, ScriptWitness, Transaction, TxIn, TxOut}
+import fr.acinq.bitcoin.ScriptFlags
+import fr.acinq.bitcoin.SigHash.SIGHASH_ALL
+import fr.acinq.bitcoin.SigVersion.SIGVERSION_WITNESS_V0
+import fr.acinq.bitcoin.scalacompat.Crypto.{PrivateKey, PublicKey, der2compact}
+import fr.acinq.bitcoin.scalacompat.{Block, BtcDouble, ByteVector32, Crypto, MilliBtcDouble, OutPoint, Satoshi, SatoshiLong, Script, ScriptWitness, Transaction, TxIn, TxOut}
 import fr.acinq.eclair.blockchain.OnChainWallet.{MakeFundingTxResponse, OnChainBalance}
 import fr.acinq.eclair.blockchain.WatcherSpec.{createSpendManyP2WPKH, createSpendP2WPKH}
 import fr.acinq.eclair.blockchain.bitcoind.BitcoindService.BitcoinReq
@@ -29,6 +32,7 @@ import fr.acinq.eclair.blockchain.bitcoind.rpc.BitcoinCoreClient._
 import fr.acinq.eclair.blockchain.bitcoind.rpc.BitcoinJsonRPCAuthMethod.UserPassword
 import fr.acinq.eclair.blockchain.bitcoind.rpc.{BasicBitcoinJsonRPCClient, BitcoinCoreClient, JsonRPCError}
 import fr.acinq.eclair.blockchain.fee.FeeratePerKw
+import fr.acinq.eclair.transactions.Transactions.{InputInfo, fee2rate, weight2fee}
 import fr.acinq.eclair.transactions.{Scripts, Transactions}
 import fr.acinq.eclair.{BlockHeight, TestConstants, TestKitBaseClass, addressToPublicKeyScript, randomKey}
 import grizzled.slf4j.Logging
@@ -532,6 +536,645 @@ class BitcoinCoreClientSpec extends TestKitBaseClass with BitcoindService with A
 
     bitcoinClient.publishTransaction(signTxResponse.tx).pipeTo(sender.ref)
     sender.expectMsg(signTxResponse.tx.txid)
+  }
+
+  test("publish package of transactions") {
+    val sender = TestProbe()
+    val bitcoinClient = new BitcoinCoreClient(bitcoinrpcclient)
+
+    val fundingPrivKey = randomKey()
+    val balancePubKey = randomKey().publicKey
+    val anchorAmount = 330.sat
+    val commitTx = {
+      val noInputCommitTx = Transaction(2, Nil, TxOut(1.btc.toSatoshi, Script.pay2wpkh(balancePubKey)) :: TxOut(anchorAmount, Script.pay2wsh(Scripts.anchor(fundingPrivKey.publicKey))) :: Nil, 0)
+      bitcoinClient.fundTransaction(noInputCommitTx, FundTransactionOptions(TestConstants.feeratePerKw)).pipeTo(sender.ref)
+      val fundTxResponse = sender.expectMsgType[FundTransactionResponse]
+      val balanceAmount = fundTxResponse.amountIn - anchorAmount
+      val zeroFeeCommitTx = fundTxResponse.tx.copy(txOut = TxOut(balanceAmount, Script.pay2wpkh(balancePubKey)) :: TxOut(anchorAmount, Script.pay2wsh(Scripts.anchor(fundingPrivKey.publicKey))) :: Nil)
+      bitcoinClient.signTransaction(zeroFeeCommitTx, Nil).pipeTo(sender.ref)
+      sender.expectMsgType[SignTransactionResponse].tx
+    }
+
+    // We can't publish the commit tx alone.
+    bitcoinClient.publishTransaction(commitTx).pipeTo(sender.ref)
+    sender.expectMsgType[Failure]
+
+    val (anchorCpfp, fees) = {
+      val notFundedTx = Transaction(2, Nil, TxOut(1000 sat, Script.pay2wpkh(randomKey().publicKey)) :: Nil, 0)
+      bitcoinClient.fundTransaction(notFundedTx, FundTransactionOptions(TestConstants.feeratePerKw)).pipeTo(sender.ref)
+      val fundTxResponse = sender.expectMsgType[FundTransactionResponse]
+      val unsignedTx = fundTxResponse.tx.copy(txIn = TxIn(OutPoint(commitTx, 1), Nil, 0) +: fundTxResponse.tx.txIn)
+      val redeemScript = Script.write(Scripts.anchor(fundingPrivKey.publicKey))
+      val sig = Transaction.signInput(unsignedTx, inputIndex = 0, redeemScript, SIGHASH_ALL, anchorAmount, SIGVERSION_WITNESS_V0, fundingPrivKey)
+      val anchorWitness = Scripts.witnessAnchor(Crypto.der2compact(sig), redeemScript)
+      val partiallySignedTx = unsignedTx.updateWitness(0, anchorWitness)
+      val previousTx = PreviousTx(InputInfo(OutPoint(commitTx, 1), commitTx.txOut(1), redeemScript), anchorWitness)
+      bitcoinClient.signTransaction(partiallySignedTx, Seq(previousTx)).pipeTo(sender.ref)
+      (sender.expectMsgType[SignTransactionResponse].tx, fundTxResponse.fee)
+    }
+
+    val packageFeerate = fee2rate(fees, anchorCpfp.weight() + commitTx.weight())
+    println(s"estimated package-feerate=$packageFeerate")
+
+    // But we can publish a package.
+    bitcoinClient.publishPackage(Seq(commitTx, anchorCpfp)).pipeTo(sender.ref)
+    val txids = sender.expectMsgType[Seq[ByteVector32]]
+    assert(txids.toSet === Set(commitTx.txid, anchorCpfp.txid))
+
+    {
+      bitcoinClient.getMempool().pipeTo(sender.ref)
+      val mempoolTxs = sender.expectMsgType[Seq[Transaction]]
+      assert(mempoolTxs.length === 2)
+      assert(mempoolTxs.contains(commitTx))
+    }
+
+    // And it's idempotent.
+    bitcoinClient.publishPackage(Seq(commitTx, anchorCpfp)).pipeTo(sender.ref)
+    assert(sender.expectMsgType[Seq[ByteVector32]].toSet == Set(commitTx.txid, anchorCpfp.txid))
+
+    // We can then fee-bump the child.
+    val anchorCpfpRbf = {
+      val notFundedTx = Transaction(2, Nil, TxOut(1000 sat, Script.pay2wpkh(randomKey().publicKey)) :: Nil, 0)
+      bitcoinClient.fundTransaction(notFundedTx, FundTransactionOptions(TestConstants.feeratePerKw * 2)).pipeTo(sender.ref)
+      val fundTxResponse = sender.expectMsgType[FundTransactionResponse]
+      val unsignedTx = fundTxResponse.tx.copy(txIn = TxIn(OutPoint(commitTx, 1), Nil, 0) +: fundTxResponse.tx.txIn)
+      val redeemScript = Script.write(Scripts.anchor(fundingPrivKey.publicKey))
+      val sig = Transaction.signInput(unsignedTx, inputIndex = 0, redeemScript, SIGHASH_ALL, anchorAmount, SIGVERSION_WITNESS_V0, fundingPrivKey)
+      val anchorWitness = Scripts.witnessAnchor(Crypto.der2compact(sig), redeemScript)
+      val partiallySignedTx = unsignedTx.updateWitness(0, anchorWitness)
+      bitcoinClient.signTransaction(partiallySignedTx, Nil).pipeTo(sender.ref)
+      sender.expectMsgType[SignTransactionResponse].tx
+    }
+
+    bitcoinClient.publishTransaction(anchorCpfpRbf).pipeTo(sender.ref)
+    sender.expectMsg(anchorCpfpRbf.txid)
+
+    {
+      bitcoinClient.getMempool().pipeTo(sender.ref)
+      val mempoolTxs = sender.expectMsgType[Seq[Transaction]]
+      assert(mempoolTxs.length === 2)
+      assert(mempoolTxs.map(_.txid).toSet === Set(commitTx.txid, anchorCpfpRbf.txid))
+    }
+  }
+
+  case class CommitTxs(alicePrivKey: PrivateKey, bobPrivKey: PrivateKey, commitTxA: Transaction, commitTxB: Transaction)
+
+  case class PackageRbfFixture(alicePrivKey: PrivateKey, bobPrivKey: PrivateKey, commitTxA: Transaction, commitTxB: Transaction, bitcoinClient: BitcoinCoreClient, probe: TestProbe) {
+    def createUnconfirmedTx(amount: Satoshi, recipient: PublicKey, feerate: FeeratePerKw): Transaction = {
+      val notFunded = Transaction(2, Nil, TxOut(amount, Script.pay2wpkh(recipient)) :: Nil, 0)
+      bitcoinClient.fundTransaction(notFunded, FundTransactionOptions(feerate, changePosition = Some(1))).pipeTo(probe.ref)
+      bitcoinClient.signTransaction(probe.expectMsgType[FundTransactionResponse].tx).pipeTo(probe.ref)
+      val signedTx = probe.expectMsgType[SignTransactionResponse].tx
+      bitcoinClient.publishTransaction(signedTx).pipeTo(probe.ref)
+      probe.expectMsg(signedTx.txid)
+      signedTx
+    }
+
+    def createUnconfirmedChain(amount: Satoshi, recipient: PublicKey, feerate: FeeratePerKw): (Transaction, Transaction) = {
+      val priv = randomKey()
+      val fee = weight2fee(feerate, 570)
+      val tx1 = createUnconfirmedTx(amount + fee, priv.publicKey, feerate)
+      val tx2 = Transaction(2, Seq(TxIn(OutPoint(tx1, 0), Nil, 0)), Seq(TxOut(amount, Script.pay2wpkh(recipient))), 0)
+      val sig = Transaction.signInput(tx2, 0, Script.pay2pkh(priv.publicKey), SIGHASH_ALL, amount + fee, SIGVERSION_WITNESS_V0, priv)
+      val signedTx = tx2.updateWitness(0, Script.witnessPay2wpkh(priv.publicKey, sig))
+      bitcoinClient.publishTransaction(signedTx).pipeTo(probe.ref)
+      probe.expectMsg(signedTx.txid)
+      (tx1, signedTx)
+    }
+  }
+
+  def createPackageRbfFixture(): PackageRbfFixture = {
+    val probe = TestProbe()
+    val bitcoinClient = new BitcoinCoreClient(bitcoinrpcclient)
+    val commitTxs = createCommitTxs(bitcoinClient, probe)
+    PackageRbfFixture(commitTxs.alicePrivKey, commitTxs.bobPrivKey, commitTxs.commitTxA, commitTxs.commitTxB, bitcoinClient, probe)
+  }
+
+  def createCommitTxs(bitcoinClient: BitcoinCoreClient, probe: TestProbe): CommitTxs = {
+    val (alicePrivKey, bobPrivKey) = (randomKey(), randomKey())
+    println(s"A's private key = ${alicePrivKey.toHex}")
+    println(s"A's public key = ${alicePrivKey.publicKey.toHex}")
+    println(s"B's private key = ${bobPrivKey.toHex}")
+    println(s"B's public key = ${bobPrivKey.publicKey.toHex}")
+    val fundingAmount = 500_660 sat
+    val fundingScript = Scripts.multiSig2of2(alicePrivKey.publicKey, bobPrivKey.publicKey)
+    val fundingTx = {
+      val notFunded = Transaction(2, Nil, Seq(TxOut(fundingAmount, Script.write(Script.pay2wsh(fundingScript)))), 0)
+      bitcoinClient.fundTransaction(notFunded, FundTransactionOptions(TestConstants.feeratePerKw, changePosition = Some(1))).pipeTo(probe.ref)
+      bitcoinClient.signTransaction(probe.expectMsgType[FundTransactionResponse].tx).pipeTo(probe.ref)
+      val signedTx = probe.expectMsgType[SignTransactionResponse].tx
+      bitcoinClient.publishTransaction(signedTx).pipeTo(probe.ref)
+      probe.expectMsg(signedTx.txid)
+      generateBlocks(1)
+      signedTx
+    }
+
+    // We create concurrent txs that look like simplified commitment transactions and pay no fees.
+    // The first input is always Alice's anchor, the second inputs is always Bob's anchor.
+    val (commitTxA, commitTxB) = {
+      val dummyCommitTx = Transaction(2, Seq(TxIn(OutPoint(fundingTx, 0), Nil, 0)), Nil, 0)
+      val commitTxA = dummyCommitTx.copy(txOut = Seq(
+        TxOut(330 sat, Script.pay2wsh(Scripts.anchor(alicePrivKey.publicKey))),
+        TxOut(330 sat, Script.pay2wsh(Scripts.anchor(bobPrivKey.publicKey))),
+        TxOut(400_000 sat, Script.pay2wsh(Scripts.toRemoteDelayed(alicePrivKey.publicKey))),
+        TxOut(100_000 sat, Script.pay2wsh(Scripts.toRemoteDelayed(bobPrivKey.publicKey))),
+      ))
+      val commitTxB = dummyCommitTx.copy(txOut = Seq(
+        TxOut(330 sat, Script.pay2wsh(Scripts.anchor(alicePrivKey.publicKey))),
+        TxOut(330 sat, Script.pay2wsh(Scripts.anchor(bobPrivKey.publicKey))),
+        TxOut(100_000 sat, Script.pay2wsh(Scripts.toRemoteDelayed(alicePrivKey.publicKey))),
+        TxOut(400_000 sat, Script.pay2wsh(Scripts.toRemoteDelayed(bobPrivKey.publicKey))),
+      ))
+      (commitTxA, commitTxB)
+    }
+
+    val aliceSigA = Transaction.signInput(commitTxA, 0, fundingScript, SIGHASH_ALL, fundingAmount, SIGVERSION_WITNESS_V0, alicePrivKey)
+    val bobSigA = Transaction.signInput(commitTxA, 0, fundingScript, SIGHASH_ALL, fundingAmount, SIGVERSION_WITNESS_V0, bobPrivKey)
+    val witnessA = Scripts.witness2of2(der2compact(aliceSigA), der2compact(bobSigA), alicePrivKey.publicKey, bobPrivKey.publicKey)
+    val signedCommitTxA = commitTxA.updateWitness(0, witnessA)
+    Transaction.correctlySpends(signedCommitTxA, Seq(fundingTx), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+
+    val aliceSigB = Transaction.signInput(commitTxB, 0, fundingScript, SIGHASH_ALL, fundingAmount, SIGVERSION_WITNESS_V0, alicePrivKey)
+    val bobSigB = Transaction.signInput(commitTxB, 0, fundingScript, SIGHASH_ALL, fundingAmount, SIGVERSION_WITNESS_V0, bobPrivKey)
+    val witnessB = Scripts.witness2of2(der2compact(aliceSigB), der2compact(bobSigB), alicePrivKey.publicKey, bobPrivKey.publicKey)
+    val signedCommitTxB = commitTxB.updateWitness(0, witnessB)
+    Transaction.correctlySpends(signedCommitTxB, Seq(fundingTx), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+
+    println(s"CommitTxA = ${signedCommitTxA.toString()}")
+    println(s"CommitTxB = ${signedCommitTxB.toString()}")
+    println(s"  Input: amount = $fundingAmount, script = ${Script.write(Script.pay2wsh(fundingScript)).toHex} (p2wsh(multisig2of2(${alicePrivKey.publicKey.toHex}, ${bobPrivKey.publicKey.toHex}))")
+
+    CommitTxs(alicePrivKey, bobPrivKey, signedCommitTxA, signedCommitTxB)
+  }
+
+  test("package-rbf #1") {
+    println("----- Generating CommitTxA and CommitTxB -----")
+    val f = createPackageRbfFixture()
+    import f._
+
+    // Mempool #1:
+    //
+    // +-----------+  +-----------+
+    // | CommitTxA |  | ChangeTxA |
+    // +-----------+  +-----------+
+    //       |              |
+    //       +-----+  +-----+
+    //             |  |
+    //             v  v
+    //         +-----------+
+    //         | AnchorTxA |
+    //         +-----------+
+    val changeTxA = f.createUnconfirmedTx(100_000 sat, alicePrivKey.publicKey, FeeratePerKw(500 sat))
+    val anchorTxA = {
+      val unsignedTx = Transaction(2, Seq(TxIn(OutPoint(commitTxA, 0), Nil, 0), TxIn(OutPoint(changeTxA, 0), Nil, 0)), Seq(TxOut(99_000 sat, Script.pay2wpkh(randomKey().publicKey))), 0)
+      val sig0 = Transaction.signInput(unsignedTx, 0, Scripts.anchor(alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, alicePrivKey)
+      val sig1 = Transaction.signInput(unsignedTx, 1, Script.pay2pkh(alicePrivKey.publicKey), SIGHASH_ALL, 100_000 sat, SIGVERSION_WITNESS_V0, alicePrivKey)
+      unsignedTx
+        .updateWitness(0, Scripts.witnessAnchor(der2compact(sig0), Script.write(Scripts.anchor(alicePrivKey.publicKey))))
+        .updateWitness(1, Script.witnessPay2wpkh(alicePrivKey.publicKey, sig1))
+    }
+    Transaction.correctlySpends(anchorTxA, Seq(commitTxA, changeTxA), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+
+    println(s"ChangeTxA = ${changeTxA.toString()}")
+    println(s"  Output: amount = ${100_000 sat}, script = ${Script.write(Script.pay2wpkh(alicePrivKey.publicKey)).toHex} (p2wpkh(${alicePrivKey.publicKey.toHex}))")
+    println(s"AnchorTxA = ${anchorTxA.toString()}")
+
+    // NB: we must include all unconfirmed parents in the package, even if they're already in the mempool.
+    bitcoinClient.publishPackage(Seq(commitTxA, anchorTxA)).pipeTo(probe.ref)
+    probe.expectMsgType[Failure]
+
+    bitcoinClient.publishPackage(Seq(commitTxA, changeTxA, anchorTxA)).pipeTo(probe.ref)
+    assert(probe.expectMsgType[Seq[ByteVector32]].toSet == Set(commitTxA.txid, changeTxA.txid, anchorTxA.txid))
+
+    bitcoinClient.getMempoolTx(commitTxA.txid).pipeTo(probe.ref)
+    assert(probe.expectMsgType[MempoolTx].fees == 0.sat)
+
+    bitcoinClient.getMempoolTx(anchorTxA.txid).pipeTo(probe.ref)
+    assert(probe.expectMsgType[MempoolTx].ancestorCount == 2)
+
+    // Mempool #2:
+    //
+    // +-----------+  +-----------+
+    // | CommitTxB |  | ChangeTxB |
+    // +-----------+  +-----------+
+    //       |              |
+    //       +-----+  +-----+
+    //             |  |
+    //             v  v
+    //         +-----------+
+    //         | AnchorTxB |
+    //         +-----------+
+    val changeTxB = f.createUnconfirmedTx(100_000 sat, bobPrivKey.publicKey, FeeratePerKw(500 sat))
+    val anchorTxB = {
+      val unsignedTx = Transaction(2, Seq(TxIn(OutPoint(commitTxB, 1), Nil, 0), TxIn(OutPoint(changeTxB, 0), Nil, 0)), Seq(TxOut(98_000 sat, Script.pay2wpkh(randomKey().publicKey))), 0)
+      val sig0 = Transaction.signInput(unsignedTx, 0, Scripts.anchor(bobPrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, bobPrivKey)
+      val sig1 = Transaction.signInput(unsignedTx, 1, Script.pay2pkh(bobPrivKey.publicKey), SIGHASH_ALL, 100_000 sat, SIGVERSION_WITNESS_V0, bobPrivKey)
+      unsignedTx
+        .updateWitness(0, Scripts.witnessAnchor(der2compact(sig0), Script.write(Scripts.anchor(bobPrivKey.publicKey))))
+        .updateWitness(1, Script.witnessPay2wpkh(bobPrivKey.publicKey, sig1))
+    }
+    Transaction.correctlySpends(anchorTxB, Seq(commitTxB, changeTxB), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+
+    println(s"ChangeTxB = ${changeTxB.toString()}")
+    println(s"  Output: amount = ${100_000 sat}, script = ${Script.write(Script.pay2wpkh(bobPrivKey.publicKey)).toHex} (p2wpkh(${bobPrivKey.publicKey.toHex}))")
+    println(s"AnchorTxB = ${anchorTxB.toString()}")
+
+    // This is a "basic" package-rbf: this should replace the previous package.
+    bitcoinClient.publishPackage(Seq(commitTxB, changeTxB, anchorTxB)).pipeTo(probe.ref)
+    assert(probe.expectMsgType[Seq[ByteVector32]].toSet == Set(commitTxB.txid, changeTxB.txid, anchorTxB.txid))
+
+    bitcoinClient.getMempoolTx(commitTxB.txid).pipeTo(probe.ref)
+    assert(probe.expectMsgType[MempoolTx].fees == 0.sat)
+
+    bitcoinClient.getMempoolTx(anchorTxB.txid).pipeTo(probe.ref)
+    assert(probe.expectMsgType[MempoolTx].ancestorCount == 2)
+
+    bitcoinClient.getMempoolTx(commitTxA.txid).pipeTo(probe.ref)
+    probe.expectMsgType[Failure]
+
+    bitcoinClient.getMempoolTx(anchorTxA.txid).pipeTo(probe.ref)
+    probe.expectMsgType[Failure]
+
+    bitcoinClient.getMempoolTx(changeTxA.txid).pipeTo(probe.ref)
+    assert(probe.expectMsgType[MempoolTx].fees > 0.sat)
+  }
+
+  test("package-rbf #2") {
+    val f = createPackageRbfFixture()
+    import f._
+
+    // Mempool #1:
+    //
+    // +-----------+  +-----------+
+    // | CommitTxA |  | ChangeTxA |
+    // +-----------+  +-----------+
+    //       |              |
+    //       +-----+  +-----+
+    //             |  |
+    //             v  v
+    //         +-----------+
+    //         | AnchorTxA |
+    //         +-----------+
+    val changeTxA = f.createUnconfirmedTx(100_000 sat, alicePrivKey.publicKey, FeeratePerKw(5000 sat))
+    val anchorTxA = {
+      val unsignedTx = Transaction(2, Seq(TxIn(OutPoint(commitTxA, 0), Nil, 0), TxIn(OutPoint(changeTxA, 0), Nil, 0)), Seq(TxOut(99_000 sat, Script.pay2wpkh(randomKey().publicKey))), 0)
+      val sig0 = Transaction.signInput(unsignedTx, 0, Scripts.anchor(alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, alicePrivKey)
+      val sig1 = Transaction.signInput(unsignedTx, 1, Script.pay2pkh(alicePrivKey.publicKey), SIGHASH_ALL, 100_000 sat, SIGVERSION_WITNESS_V0, alicePrivKey)
+      unsignedTx
+        .updateWitness(0, Scripts.witnessAnchor(der2compact(sig0), Script.write(Scripts.anchor(alicePrivKey.publicKey))))
+        .updateWitness(1, Script.witnessPay2wpkh(alicePrivKey.publicKey, sig1))
+    }
+    Transaction.correctlySpends(anchorTxA, Seq(commitTxA, changeTxA), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+    bitcoinClient.publishPackage(Seq(commitTxA, changeTxA, anchorTxA)).pipeTo(probe.ref)
+    assert(probe.expectMsgType[Seq[ByteVector32]].toSet == Set(commitTxA.txid, changeTxA.txid, anchorTxA.txid))
+
+    // Mempool #2:
+    //
+    // +-----------+  +-----------+
+    // | CommitTxB |  | ChangeTxB |
+    // +-----------+  +-----------+
+    //       |              |
+    //       +-----+  +-----+
+    //             |  |
+    //             v  v
+    //         +-----------+
+    //         | AnchorTxB |
+    //         +-----------+
+    //
+    // But here ChangeTxB has a lower feerate than ChangeTxA.
+    val changeTxB = f.createUnconfirmedTx(100_000 sat, bobPrivKey.publicKey, FeeratePerKw(500 sat))
+    val anchorTxB = {
+      val unsignedTx = Transaction(2, Seq(TxIn(OutPoint(commitTxB, 1), Nil, 0), TxIn(OutPoint(changeTxB, 0), Nil, 0)), Seq(TxOut(98_000 sat, Script.pay2wpkh(randomKey().publicKey))), 0)
+      val sig0 = Transaction.signInput(unsignedTx, 0, Scripts.anchor(bobPrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, bobPrivKey)
+      val sig1 = Transaction.signInput(unsignedTx, 1, Script.pay2pkh(bobPrivKey.publicKey), SIGHASH_ALL, 100_000 sat, SIGVERSION_WITNESS_V0, bobPrivKey)
+      unsignedTx
+        .updateWitness(0, Scripts.witnessAnchor(der2compact(sig0), Script.write(Scripts.anchor(bobPrivKey.publicKey))))
+        .updateWitness(1, Script.witnessPay2wpkh(bobPrivKey.publicKey, sig1))
+    }
+    Transaction.correctlySpends(anchorTxB, Seq(commitTxB, changeTxB), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+
+    // Since we're not replacing ChangeTxA, and [CommitTxB, AnchorTxB] is better than [CommitTxA, AnchorTxA], the replacement
+    // should be accepted.
+    bitcoinClient.publishPackage(Seq(commitTxB, changeTxB, anchorTxB)).pipeTo(probe.ref)
+    assert(probe.expectMsgType[Seq[ByteVector32]].toSet == Set(commitTxB.txid, changeTxB.txid, anchorTxB.txid))
+
+    bitcoinClient.getMempoolTx(commitTxB.txid).pipeTo(probe.ref)
+    assert(probe.expectMsgType[MempoolTx].fees == 0.sat)
+  }
+
+  test("package-rbf #3") {
+    val f = createPackageRbfFixture()
+    import f._
+
+    println("----- Generating CommitTxA1 and CommitTxB1 -----")
+    val c1 = createCommitTxs(bitcoinClient, probe)
+    println("----- Generating CommitTxA2 and CommitTxB2 -----")
+    val c2 = createCommitTxs(bitcoinClient, probe)
+    println("----- Generating CommitTxA3 and CommitTxB3 -----")
+    val c3 = createCommitTxs(bitcoinClient, probe)
+
+    // Mempool #1:
+    //
+    // +------------+  +------------+  +------------+  +-----------+
+    // | CommitTxA1 |  | CommitTxA2 |  | CommitTxA3 |  | ChangeTxA |
+    // +------------+  +------------+  +------------+  +-----------+
+    //       |              |              |                 |
+    //       +-----------+  |  +-----------+                 |
+    //                   |  |  |  +--------------------------+
+    //                   |  |  |  |
+    //                   v  v  v  v
+    //                 +-----------+
+    //                 | AnchorTxA |
+    //                 +-----------+
+    val changeTxA = f.createUnconfirmedTx(100_000 sat, alicePrivKey.publicKey, FeeratePerKw(2500 sat))
+    val anchorTxA = {
+      val inputs = Seq(c1, c2, c3).map(c => TxIn(OutPoint(c.commitTxA, 0), Nil, 0)) :+ TxIn(OutPoint(changeTxA, 0), Nil, 0)
+      val unsignedTx = Transaction(2, inputs, Seq(TxOut(98_000 sat, Script.pay2wpkh(randomKey().publicKey))), 0)
+      val sig0 = Transaction.signInput(unsignedTx, 0, Scripts.anchor(c1.alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, c1.alicePrivKey)
+      val sig1 = Transaction.signInput(unsignedTx, 1, Scripts.anchor(c2.alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, c2.alicePrivKey)
+      val sig2 = Transaction.signInput(unsignedTx, 2, Scripts.anchor(c3.alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, c3.alicePrivKey)
+      val sig3 = Transaction.signInput(unsignedTx, 3, Script.pay2pkh(alicePrivKey.publicKey), SIGHASH_ALL, 100_000 sat, SIGVERSION_WITNESS_V0, alicePrivKey)
+      unsignedTx
+        .updateWitness(0, Scripts.witnessAnchor(der2compact(sig0), Script.write(Scripts.anchor(c1.alicePrivKey.publicKey))))
+        .updateWitness(1, Scripts.witnessAnchor(der2compact(sig1), Script.write(Scripts.anchor(c2.alicePrivKey.publicKey))))
+        .updateWitness(2, Scripts.witnessAnchor(der2compact(sig2), Script.write(Scripts.anchor(c3.alicePrivKey.publicKey))))
+        .updateWitness(3, Script.witnessPay2wpkh(alicePrivKey.publicKey, sig3))
+    }
+    Transaction.correctlySpends(anchorTxA, Seq(c1.commitTxA, c2.commitTxA, c3.commitTxA, changeTxA), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+    bitcoinClient.publishPackage(Seq(c1.commitTxA, c2.commitTxA, c3.commitTxA, changeTxA, anchorTxA)).pipeTo(probe.ref)
+    assert(probe.expectMsgType[Seq[ByteVector32]].toSet == Set(c1.commitTxA.txid, c2.commitTxA.txid, c3.commitTxA.txid, changeTxA.txid, anchorTxA.txid))
+
+    println(s"ChangeTxA = ${changeTxA.toString()}")
+    println(s"  Output: amount = ${100_000 sat}, script = ${Script.write(Script.pay2wpkh(alicePrivKey.publicKey)).toHex} (p2wpkh(${alicePrivKey.publicKey.toHex}))")
+    println(s"AnchorTxA = ${anchorTxA.toString()}")
+
+    // Mempool #2:
+    //                 +------------+
+    //                 | ChangeTxB1 |
+    //                 +------------+
+    //                       |
+    //                       v
+    // +------------+  +------------+
+    // | CommitTxB1 |  | ChangeTxB2 |
+    // +------------+  +------------+
+    //       |               |
+    //       +----+  +-------+
+    //            |  |
+    //            v  v
+    //        +-----------+
+    //        | AnchorTxB |
+    //        +-----------+
+    val (changeTxB1, changeTxB2) = f.createUnconfirmedChain(50_000 sat, bobPrivKey.publicKey, FeeratePerKw(1000 sat))
+    val anchorTxB = {
+      val unsignedTx = Transaction(2, Seq(TxIn(OutPoint(c1.commitTxB, 1), Nil, 0), TxIn(OutPoint(changeTxB2, 0), Nil, 0)), Seq(TxOut(45_000 sat, Script.pay2wpkh(randomKey().publicKey))), 0)
+      val sig0 = Transaction.signInput(unsignedTx, 0, Scripts.anchor(c1.bobPrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, c1.bobPrivKey)
+      val sig1 = Transaction.signInput(unsignedTx, 1, Script.pay2pkh(bobPrivKey.publicKey), SIGHASH_ALL, 50_000 sat, SIGVERSION_WITNESS_V0, bobPrivKey)
+      unsignedTx
+        .updateWitness(0, Scripts.witnessAnchor(der2compact(sig0), Script.write(Scripts.anchor(c1.bobPrivKey.publicKey))))
+        .updateWitness(1, Script.witnessPay2wpkh(bobPrivKey.publicKey, sig1))
+    }
+    Transaction.correctlySpends(anchorTxB, Seq(c1.commitTxB, changeTxB2), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+
+    println(s"ChangeTxB1 = ${changeTxB1.toString()}")
+    println(s"ChangeTxB2 = ${changeTxB2.toString()}")
+    println(s"  Output: amount = ${50_000 sat}, script = ${Script.write(Script.pay2wpkh(bobPrivKey.publicKey)).toHex} (p2wpkh(${bobPrivKey.publicKey.toHex}))")
+    println(s"AnchorTxB = ${anchorTxB.toString()}")
+
+    bitcoinClient.publishPackage(Seq(c1.commitTxB, changeTxB2, anchorTxB)).pipeTo(probe.ref)
+    assert(probe.expectMsgType[Seq[ByteVector32]].toSet == Set(c1.commitTxB.txid, changeTxB2.txid, anchorTxB.txid))
+
+    bitcoinClient.getMempoolTx(c1.commitTxB.txid).pipeTo(probe.ref)
+    assert(probe.expectMsgType[MempoolTx].fees == 0.sat)
+
+    // The conflicting commit tx and its anchor are evicted.
+    Seq(c1.commitTxA, anchorTxA).foreach(tx => {
+      bitcoinClient.getMempoolTx(tx.txid).pipeTo(probe.ref)
+      probe.expectMsgType[Failure]
+    })
+
+    // But the other commit txs are not evicted, even though they pay 0 fees.
+    Seq(c2.commitTxA, c3.commitTxA).foreach(tx => {
+      bitcoinClient.getMempoolTx(tx.txid).pipeTo(probe.ref)
+      probe.expectMsgType[MempoolTx]
+    })
+  }
+
+  test("package-rbf #4") {
+    val f = createPackageRbfFixture()
+    import f._
+
+    println("----- Generating CommitTxA1 and CommitTxB1 -----")
+    val c1 = createCommitTxs(bitcoinClient, probe)
+    println("----- Generating CommitTxA2 and CommitTxB2 -----")
+    val c2 = createCommitTxs(bitcoinClient, probe)
+    println("----- Generating CommitTxA3 and CommitTxB3 -----")
+    val c3 = createCommitTxs(bitcoinClient, probe)
+
+    // Mempool #1:
+    //
+    // +------------+  +------------+  +------------+  +------------+
+    // | CommitTxA1 |  | CommitTxA2 |  | CommitTxA3 |  | ChangeTxA1 |
+    // +------------+  +------------+  +------------+  +------------+
+    //       |              |              |                 |
+    //       +-----------+  |  +-----------+                 |
+    //                   |  |  |  +--------------------------+
+    //                   |  |  |  |
+    //                   v  v  v  v
+    //                 +------------+
+    //                 | AnchorTxA1 |
+    //                 +------------+
+    val changeTxA1 = f.createUnconfirmedTx(100_000 sat, alicePrivKey.publicKey, FeeratePerKw(2500 sat))
+    val anchorTxA1 = {
+      val inputs = Seq(c1, c2, c3).map(c => TxIn(OutPoint(c.commitTxA, 0), Nil, 0)) :+ TxIn(OutPoint(changeTxA1, 0), Nil, 0)
+      val unsignedTx = Transaction(2, inputs, Seq(TxOut(98_000 sat, Script.pay2wpkh(randomKey().publicKey))), 0)
+      val sig0 = Transaction.signInput(unsignedTx, 0, Scripts.anchor(c1.alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, c1.alicePrivKey)
+      val sig1 = Transaction.signInput(unsignedTx, 1, Scripts.anchor(c2.alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, c2.alicePrivKey)
+      val sig2 = Transaction.signInput(unsignedTx, 2, Scripts.anchor(c3.alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, c3.alicePrivKey)
+      val sig3 = Transaction.signInput(unsignedTx, 3, Script.pay2pkh(alicePrivKey.publicKey), SIGHASH_ALL, 100_000 sat, SIGVERSION_WITNESS_V0, alicePrivKey)
+      unsignedTx
+        .updateWitness(0, Scripts.witnessAnchor(der2compact(sig0), Script.write(Scripts.anchor(c1.alicePrivKey.publicKey))))
+        .updateWitness(1, Scripts.witnessAnchor(der2compact(sig1), Script.write(Scripts.anchor(c2.alicePrivKey.publicKey))))
+        .updateWitness(2, Scripts.witnessAnchor(der2compact(sig2), Script.write(Scripts.anchor(c3.alicePrivKey.publicKey))))
+        .updateWitness(3, Script.witnessPay2wpkh(alicePrivKey.publicKey, sig3))
+    }
+    Transaction.correctlySpends(anchorTxA1, Seq(c1.commitTxA, c2.commitTxA, c3.commitTxA, changeTxA1), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+    bitcoinClient.publishPackage(Seq(c1.commitTxA, c2.commitTxA, c3.commitTxA, changeTxA1, anchorTxA1)).pipeTo(probe.ref)
+    assert(probe.expectMsgType[Seq[ByteVector32]].toSet == Set(c1.commitTxA.txid, c2.commitTxA.txid, c3.commitTxA.txid, changeTxA1.txid, anchorTxA1.txid))
+
+    println(s"ChangeTxA1 = ${changeTxA1.toString()}")
+    println(s"  Output: amount = ${100_000 sat}, script = ${Script.write(Script.pay2wpkh(alicePrivKey.publicKey)).toHex} (p2wpkh(${alicePrivKey.publicKey.toHex}))")
+    println(s"AnchorTxA1 = ${anchorTxA1.toString()}")
+
+    // Mempool #2:
+    //                                 +------------+
+    //                                 | ChangeTxA2 |
+    //                                 +------------+
+    //                                       |
+    //                                       v
+    // +------------+  +------------+  +------------+
+    // | CommitTxA1 |  | CommitTxA4 |  | ChangeTxA3 |
+    // +------------+  +------------+  +------------+
+    //       |              |                |
+    //       +---+  +-------+                |
+    //           |  |  +---------------------+
+    //           |  |  |
+    //           v  v  v
+    //        +------------+
+    //        | AnchorTxA2 |
+    //        +------------+
+    println("----- Generating CommitTxA4 and CommitTxB4 -----")
+    val c4 = createCommitTxs(bitcoinClient, probe)
+    val (changeTxA2, changeTxA3) = f.createUnconfirmedChain(50_000 sat, alicePrivKey.publicKey, FeeratePerKw(1000 sat))
+    val anchorTxA2 = {
+      val unsignedTx = Transaction(2, Seq(TxIn(OutPoint(c1.commitTxA, 0), Nil, 0), TxIn(OutPoint(c4.commitTxA, 0), Nil, 0), TxIn(OutPoint(changeTxA3, 0), Nil, 0)), Seq(TxOut(45_000 sat, Script.pay2wpkh(randomKey().publicKey))), 0)
+      val sig0 = Transaction.signInput(unsignedTx, 0, Scripts.anchor(c1.alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, c1.alicePrivKey)
+      val sig1 = Transaction.signInput(unsignedTx, 1, Scripts.anchor(c4.alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, c4.alicePrivKey)
+      val sig2 = Transaction.signInput(unsignedTx, 2, Script.pay2pkh(alicePrivKey.publicKey), SIGHASH_ALL, 50_000 sat, SIGVERSION_WITNESS_V0, alicePrivKey)
+      unsignedTx
+        .updateWitness(0, Scripts.witnessAnchor(der2compact(sig0), Script.write(Scripts.anchor(c1.alicePrivKey.publicKey))))
+        .updateWitness(1, Scripts.witnessAnchor(der2compact(sig1), Script.write(Scripts.anchor(c4.alicePrivKey.publicKey))))
+        .updateWitness(2, Script.witnessPay2wpkh(alicePrivKey.publicKey, sig2))
+    }
+    Transaction.correctlySpends(anchorTxA2, Seq(c1.commitTxA, c4.commitTxA, changeTxA3), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+
+    println(s"ChangeTxA2 = ${changeTxA2.toString()}")
+    println(s"ChangeTxA3 = ${changeTxA3.toString()}")
+    println(s"  Output: amount = ${50_000 sat}, script = ${Script.write(Script.pay2wpkh(alicePrivKey.publicKey)).toHex} (p2wpkh(${alicePrivKey.publicKey.toHex}))")
+    println(s"AnchorTxA2 = ${anchorTxA2.toString()}")
+
+    // TODO: this test triggers the following error: Internal bug detected: "it != package_result.m_tx_results.end()"
+    bitcoinClient.publishPackage(Seq(c1.commitTxA, c4.commitTxA, changeTxA3, anchorTxA2)).pipeTo(probe.ref)
+    assert(probe.expectMsgType[Seq[ByteVector32]].toSet == Set(c1.commitTxA.txid, c4.commitTxA.txid, changeTxA3.txid, anchorTxA2.txid))
+
+    // The conflicting anchor is evicted.
+    bitcoinClient.getMempoolTx(anchorTxA1.txid).pipeTo(probe.ref)
+    probe.expectMsgType[Failure]
+
+    // But the other commit txs are not evicted, even though they pay 0 fees.
+    Seq(c1.commitTxA, c2.commitTxA, c3.commitTxA, c4.commitTxA).foreach(tx => {
+      bitcoinClient.getMempoolTx(tx.txid).pipeTo(probe.ref)
+      assert(probe.expectMsgType[MempoolTx].fees == 0.sat)
+    })
+  }
+
+  test("package-rbf #5") {
+    val f = createPackageRbfFixture()
+    import f._
+
+    // Mempool #1:
+    //
+    // +-----------+  +-----------+
+    // | CommitTxA |  | ChangeTxA |
+    // +-----------+  +-----------+
+    //       |              |
+    //       +-----+  +-----+
+    //             |  |
+    //             v  v
+    //         +-----------+
+    //         | AnchorTxA |
+    //         +-----------+
+    //               |
+    //              ... low feerate descendants
+    //               |
+    //               v
+    //         +-----------+
+    //         |  JunkTxA  | high feerate descendant
+    //         +-----------+
+    val changeTxA = f.createUnconfirmedTx(1_000_000 sat, alicePrivKey.publicKey, FeeratePerKw(500 sat))
+    val anchorTxA = {
+      val unsignedTx = Transaction(2, Seq(TxIn(OutPoint(commitTxA, 0), Nil, 0), TxIn(OutPoint(changeTxA, 0), Nil, 0)), Seq(TxOut(999_000 sat, Script.pay2wpkh(alicePrivKey.publicKey))), 0)
+      val sig0 = Transaction.signInput(unsignedTx, 0, Scripts.anchor(alicePrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, alicePrivKey)
+      val sig1 = Transaction.signInput(unsignedTx, 1, Script.pay2pkh(alicePrivKey.publicKey), SIGHASH_ALL, 1_000_000 sat, SIGVERSION_WITNESS_V0, alicePrivKey)
+      unsignedTx
+        .updateWitness(0, Scripts.witnessAnchor(der2compact(sig0), Script.write(Scripts.anchor(alicePrivKey.publicKey))))
+        .updateWitness(1, Script.witnessPay2wpkh(alicePrivKey.publicKey, sig1))
+    }
+    Transaction.correctlySpends(anchorTxA, Seq(commitTxA, changeTxA), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+
+    println(s"ChangeTxA = ${changeTxA.toString()}")
+    println(s"  Output: amount = ${1_000_000 sat}, script = ${Script.write(Script.pay2wpkh(alicePrivKey.publicKey)).toHex} (p2wpkh(${alicePrivKey.publicKey.toHex}))")
+    println(s"AnchorTxA = ${anchorTxA.toString()}")
+
+    bitcoinClient.publishPackage(Seq(commitTxA, changeTxA, anchorTxA)).pipeTo(probe.ref)
+    assert(probe.expectMsgType[Seq[ByteVector32]].toSet == Set(commitTxA.txid, changeTxA.txid, anchorTxA.txid))
+
+    bitcoinClient.getMempoolTx(anchorTxA.txid).pipeTo(probe.ref)
+    val mempoolAnchorA = probe.expectMsgType[MempoolTx]
+    val anchorFeerateA = fee2rate(mempoolAnchorA.fees, mempoolAnchorA.weight.toInt)
+    assert(anchorFeerateA <= FeeratePerKw(2500 sat))
+    println(s"anchor feerate=$anchorFeerateA")
+
+    // Create a chain of low feerate descendants.
+    var lastChild = anchorTxA
+    (1 to 21).foreach(i => {
+      val currentAmount = lastChild.txOut.head.amount
+      // We add outputs to make the tx bigger than the last child while paying a low feerate
+      val dummyOutputs = (1 to 10).map(_ => TxOut(1000 sat, Script.pay2pkh(randomKey().publicKey)))
+      val nextTx = Transaction(2, Seq(TxIn(OutPoint(lastChild, 0), Nil, 0)), TxOut(currentAmount - 10_500.sat, Script.pay2wpkh(alicePrivKey.publicKey)) +: dummyOutputs, 0)
+      val sig = Transaction.signInput(nextTx, 0, Script.pay2pkh(alicePrivKey.publicKey), SIGHASH_ALL, currentAmount, SIGVERSION_WITNESS_V0, alicePrivKey)
+      lastChild = nextTx.updateWitness(0, Script.witnessPay2wpkh(alicePrivKey.publicKey, sig))
+      println(s"Descendant$i = ${lastChild.toString()}")
+      bitcoinClient.publishTransaction(lastChild).pipeTo(probe.ref)
+      probe.expectMsg(lastChild.txid)
+    })
+
+    // Add a final high feerate descendant.
+    {
+      val currentAmount = lastChild.txOut.head.amount
+      val nextTx = Transaction(2, Seq(TxIn(OutPoint(lastChild, 0), Nil, 0)), Seq(TxOut(currentAmount - 25000.sat, Script.pay2wpkh(alicePrivKey.publicKey))), 0)
+      val sig = Transaction.signInput(nextTx, 0, Script.pay2pkh(alicePrivKey.publicKey), SIGHASH_ALL, currentAmount, SIGVERSION_WITNESS_V0, alicePrivKey)
+      lastChild = nextTx.updateWitness(0, Script.witnessPay2wpkh(alicePrivKey.publicKey, sig))
+      println(s"Last descendant = ${lastChild.toString()}")
+      bitcoinClient.publishTransaction(lastChild).pipeTo(probe.ref)
+      probe.expectMsg(lastChild.txid)
+    }
+
+    bitcoinClient.getMempoolTx(lastChild.txid).pipeTo(probe.ref)
+    val mempoolLastChild = probe.expectMsgType[MempoolTx]
+    val lastChildFeerate = fee2rate(mempoolLastChild.fees, mempoolLastChild.weight.toInt)
+    println(s"high-feerate pinning descendant: feerate=$lastChildFeerate")
+
+    // Mempool #2:
+    //
+    // +-----------+  +-----------+
+    // | CommitTxB |  | ChangeTxB |
+    // +-----------+  +-----------+
+    //       |              |
+    //       +-----+  +-----+
+    //             |  |
+    //             v  v
+    //         +-----------+
+    //         | AnchorTxB |
+    //         +-----------+
+    val changeTxB = f.createUnconfirmedTx(100_000 sat, bobPrivKey.publicKey, FeeratePerKw(500 sat))
+    val anchorTxB = {
+      val unsignedTx = Transaction(2, Seq(TxIn(OutPoint(commitTxB, 1), Nil, 0), TxIn(OutPoint(changeTxB, 0), Nil, 0)), Seq(TxOut(63_000 sat, Script.pay2wpkh(randomKey().publicKey))), 0)
+      val sig0 = Transaction.signInput(unsignedTx, 0, Scripts.anchor(bobPrivKey.publicKey), SIGHASH_ALL, 330 sat, SIGVERSION_WITNESS_V0, bobPrivKey)
+      val sig1 = Transaction.signInput(unsignedTx, 1, Script.pay2pkh(bobPrivKey.publicKey), SIGHASH_ALL, 100_000 sat, SIGVERSION_WITNESS_V0, bobPrivKey)
+      unsignedTx
+        .updateWitness(0, Scripts.witnessAnchor(der2compact(sig0), Script.write(Scripts.anchor(bobPrivKey.publicKey))))
+        .updateWitness(1, Script.witnessPay2wpkh(bobPrivKey.publicKey, sig1))
+    }
+    Transaction.correctlySpends(anchorTxB, Seq(commitTxB, changeTxB), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
+
+    println(s"ChangeTxB = ${changeTxB.toString()}")
+    println(s"  Output: amount = ${100_000 sat}, script = ${Script.write(Script.pay2wpkh(bobPrivKey.publicKey)).toHex} (p2wpkh(${bobPrivKey.publicKey.toHex}))")
+    println(s"AnchorTxB = ${anchorTxB.toString()}")
+
+    bitcoinClient.publishPackage(Seq(commitTxB, changeTxB, anchorTxB)).pipeTo(probe.ref)
+    assert(probe.expectMsgType[Seq[ByteVector32]].toSet == Set(commitTxB.txid, changeTxB.txid, anchorTxB.txid))
+
+    // The previous anchor and its descendants are evicted.
+    bitcoinClient.getMempoolTx(anchorTxA.txid).pipeTo(probe.ref)
+    probe.expectMsgType[Failure]
+
+    // We don't need to match the last descendant's feerate.
+    bitcoinClient.getMempoolTx(anchorTxB.txid).pipeTo(probe.ref)
+    val mempoolAnchorB = probe.expectMsgType[MempoolTx]
+    val anchorFeerateB = fee2rate(mempoolAnchorB.fees, mempoolAnchorB.weight.toInt)
+    assert(anchorFeerateA < anchorFeerateB)
+    assert(anchorFeerateB < lastChildFeerate)
+    println(s"new anchor feerate=$anchorFeerateB")
   }
 
   test("send and list transactions") {
